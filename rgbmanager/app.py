@@ -11,11 +11,15 @@ import threading
 
 from .constants import (
     ANIMATION_MODES, STATIC_PRESETS, DYNAMIC_PRESETS,
+    BLEND_MODES, BLEND_MODE_LABELS,
     C_PRIMARY, C_ACCENT, KNOB_DEBOUNCE,
 )
-from .service  import RGBService
-from .widgets  import CircularKnob, KeyboardVisual, ColorCircle
-from .styles   import apply_css
+from .service        import RGBService
+from .layer_service  import LayerService, default_layer
+from .compositor     import LayerCompositor
+from .animator       import AnimationLoop, get_frame_colors
+from .widgets        import CircularKnob, KeyboardVisual, ColorCircle
+from .styles         import apply_css
 
 
 class RGBManagerApp(Gtk.Application):
@@ -23,7 +27,10 @@ class RGBManagerApp(Gtk.Application):
 
     def __init__(self):
         super().__init__(application_id="dev.omen.rgb-manager")
-        self.service = RGBService()
+        self.service     = RGBService()
+        self.layer_svc   = LayerService()
+        self.compositor  = LayerCompositor()
+        self.anim_loop   = AnimationLoop(self.compositor, self.service)
         self._brightness_timer = None
         self._speed_timer = None
 
@@ -34,7 +41,11 @@ class RGBManagerApp(Gtk.Application):
         self.current_speed     = state["speed"]
         self.current_direction = state["direction"]
         self._init_brightness  = state["brightness"]
-        self._mode_buttons = {}
+        self._mode_buttons     = {}
+
+        # Layer UI state
+        self._layers_list_box  = None  # Gtk.ListBox ref
+        self._layer_apply_btn  = None  # The composite+apply button
 
     # ── Background tasks ───────────────────────────────────────────────────────
     def _async(self, fn, *args):
@@ -121,6 +132,11 @@ class RGBManagerApp(Gtk.Application):
         outer.pack_start(self._vspace(12),            False, False, 0)
         outer.pack_start(self._build_status_bar(),    False, False, 0)
 
+        # Start animation loop (Phase 2: replaces kernel timer)
+        layers = self.layer_svc.load()
+        self.anim_loop.update_layers(layers)
+        self.anim_loop.start()
+
         win.show_all()
 
     # ── Layout helpers ─────────────────────────────────────────────────────────
@@ -193,6 +209,9 @@ class RGBManagerApp(Gtk.Application):
             flow.add(btn)
         sp_card.pack_start(flow, False, False, 0)
         panel.pack_start(sp_card, False, False, 0)
+
+        # Layers panel
+        panel.pack_start(self._build_layers_panel(), False, False, 0)
 
         return panel
 
@@ -432,3 +451,243 @@ class RGBManagerApp(Gtk.Application):
         self.status_label.get_style_context().add_class("status-bar")
         box.pack_start(self.status_label, True, True, 0)
         return box
+
+    # ── Application quit ───────────────────────────────────────────────────────
+    def do_quit(self):
+        self.anim_loop.stop()
+        super().do_quit()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Layers panel
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_layers_panel(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("card")
+
+        # Header row
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hdr.pack_start(self._sec("MY LAYERS"), True, True, 0)
+        card.pack_start(hdr, False, False, 0)
+
+        # Save row: name entry + save button
+        save_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._layer_name_entry = Gtk.Entry()
+        self._layer_name_entry.set_placeholder_text("Layer name...")
+        self._layer_name_entry.set_hexpand(True)
+        save_btn = Gtk.Button(label="Save Current")
+        save_btn.get_style_context().add_class("layer-save-btn")
+        save_btn.set_tooltip_text("Save current keyboard state as a new layer")
+        save_btn.connect("clicked", self._on_layer_save)
+        save_row.pack_start(self._layer_name_entry, True, True, 0)
+        save_row.pack_start(save_btn, False, False, 0)
+        card.pack_start(save_row, False, False, 0)
+
+        # Scrollable layer list
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(180)
+        scroll.set_max_content_height(380)
+
+        self._layers_list_box = Gtk.ListBox()
+        self._layers_list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._layers_list_box.get_style_context().add_class("layers-list")
+        scroll.add(self._layers_list_box)
+        card.pack_start(scroll, True, True, 0)
+        self._refresh_layers_list()
+
+        # Composite & Apply button
+        self._layer_apply_btn = Gtk.Button(label="Composite & Apply All")
+        self._layer_apply_btn.get_style_context().add_class("layer-apply-btn")
+        self._layer_apply_btn.set_tooltip_text(
+            "Blend all enabled layers and push the result to the keyboard")
+        self._layer_apply_btn.connect("clicked", self._on_layer_composite_apply)
+        card.pack_start(self._layer_apply_btn, False, False, 0)
+
+        return card
+
+    # ── Layers list helpers ────────────────────────────────────────────────────
+
+    def _refresh_layers_list(self):
+        """Rebuild the layer list box from disk."""
+        box = self._layers_list_box
+        for child in box.get_children():
+            box.remove(child)
+
+        layers = self.layer_svc.load()
+        self.anim_loop.update_layers(layers)
+
+        if not layers:
+            lbl = Gtk.Label(label="No layers yet. Type a name above and click Save.")
+            lbl.get_style_context().add_class("layers-empty")
+            lbl.set_margin_top(8);  lbl.set_margin_bottom(8)
+            box.add(lbl)
+        else:
+            for layer in layers:
+                row = self._build_layer_row(layer)
+                box.add(row)
+
+        box.show_all()
+
+    def _build_layer_row(self, layer: dict) -> Gtk.Widget:
+        name       = layer.get("name", "?")
+        enabled    = layer.get("enabled", True)
+        zone_mask  = layer.get("zone_mask", [True, True, True, True])
+        blend_mode = layer.get("blend_mode", "override")
+        blend_amt  = int(layer.get("blend_amount", 1.0) * 100)
+        mode       = layer.get("mode", "static")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        outer.get_style_context().add_class("layer-row")
+        outer.set_margin_bottom(2)
+
+        # ── Top row: toggle | name | mode chip | reorder | delete ──────────────
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        sw = Gtk.Switch()
+        sw.set_active(enabled)
+        sw.set_valign(Gtk.Align.CENTER)
+        sw.connect("notify::active", self._on_layer_toggle, name)
+        top.pack_start(sw, False, False, 0)
+
+        name_lbl = Gtk.Label(label=name)
+        name_lbl.get_style_context().add_class("layer-name-lbl")
+        name_lbl.set_halign(Gtk.Align.START)
+        name_lbl.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        top.pack_start(name_lbl, True, True, 0)
+
+        # Mode chip
+        mode_chip = Gtk.Label(label=mode)
+        mode_chip.get_style_context().add_class("desc-label")
+        top.pack_start(mode_chip, False, False, 0)
+
+        # Reorder buttons
+        for arrow, direction in (("↑", "up"), ("↓", "down")):
+            btn = Gtk.Button(label=arrow)
+            btn.get_style_context().add_class("layer-reorder-btn")
+            btn.connect("clicked", self._on_layer_reorder, name, direction)
+            top.pack_start(btn, False, False, 0)
+
+        # Delete button
+        del_btn = Gtk.Button(label="✕")
+        del_btn.get_style_context().add_class("layer-del-btn")
+        del_btn.set_tooltip_text(f"Delete layer '{name}'")
+        del_btn.connect("clicked", self._on_layer_delete, name)
+        top.pack_start(del_btn, False, False, 0)
+
+        outer.pack_start(top, False, False, 0)
+
+        # ── Bottom row: zone mask | blend mode | opacity ───────────────────────
+        bot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        # Zone mask toggle pills
+        for i in range(4):
+            z_btn = Gtk.Button(label=f"Z{i+1}")
+            z_btn.get_style_context().add_class("zone-mask-btn")
+            if zone_mask[i]:
+                z_btn.get_style_context().add_class("zone-mask-active")
+            z_btn.set_tooltip_text(f"Toggle zone {i+1} for this layer")
+            z_btn.connect("clicked", self._on_zone_mask_toggle, name, i)
+            bot.pack_start(z_btn, False, False, 0)
+
+        # Blend mode combo
+        combo = Gtk.ComboBoxText()
+        combo.get_style_context().add_class("blend-combo")
+        for m in BLEND_MODES:
+            combo.append(m, BLEND_MODE_LABELS[m])
+        combo.set_active_id(blend_mode)
+        combo.set_tooltip_text("Blend mode for this layer")
+        combo.connect("changed", self._on_blend_mode_change, name)
+        bot.pack_start(combo, False, False, 0)
+
+        # Opacity label + scale
+        op_lbl = Gtk.Label(label="Opacity:")
+        op_lbl.get_style_context().add_class("desc-label")
+        bot.pack_start(op_lbl, False, False, 0)
+
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        scale.set_value(blend_amt)
+        scale.set_draw_value(False)
+        scale.set_size_request(120, -1)
+        scale.set_tooltip_text(f"Opacity: {blend_amt}%")
+        scale.connect("value-changed", self._on_blend_amount_change, name)
+        bot.pack_start(scale, False, False, 0)
+
+        outer.pack_start(bot, False, False, 0)
+        return outer
+
+    # ── Layer callbacks ────────────────────────────────────────────────────────
+
+    def _on_layer_save(self, btn):
+        name = self._layer_name_entry.get_text().strip()
+        if not name:
+            self._status("Enter a layer name first.", False)
+            return
+        layer = default_layer(
+            name        = name,
+            zones       = list(self.zone_colors),
+            mode        = self.active_mode_key,
+            speed       = self.current_speed,
+            brightness  = int(self.brightness_knob.value),
+            direction   = self.current_direction,
+        )
+        self.layer_svc.upsert(layer)
+        self._layer_name_entry.set_text("")
+        self._refresh_layers_list()
+        self._status(f"Layer '{name}' saved.")
+
+    def _on_layer_toggle(self, sw, _param, name):
+        self.layer_svc.update_field(name, "enabled", sw.get_active())
+        self._refresh_layers_list()
+
+    def _on_layer_reorder(self, btn, name, direction):
+        self.layer_svc.move(name, direction)
+        self._refresh_layers_list()
+
+    def _on_layer_delete(self, btn, name):
+        self.layer_svc.delete(name)
+        self._refresh_layers_list()
+        self._status(f"Layer '{name}' deleted.")
+
+    def _on_zone_mask_toggle(self, btn, name, zone_idx):
+        layers = self.layer_svc.load()
+        for l in layers:
+            if l.get("name") == name:
+                mask = l.get("zone_mask", [True, True, True, True])
+                mask[zone_idx] = not mask[zone_idx]
+                l["zone_mask"] = mask
+                break
+        self.layer_svc.save(layers)
+        self._refresh_layers_list()
+
+    def _on_blend_mode_change(self, combo, name):
+        mode = combo.get_active_id()
+        if mode:
+            self.layer_svc.update_field(name, "blend_mode", mode)
+            self._refresh_layers_list()
+
+    def _on_blend_amount_change(self, scale, name):
+        amount = scale.get_value() / 100.0
+        self.layer_svc.update_field(name, "blend_amount", round(amount, 2))
+        self._refresh_layers_list()
+
+    def _on_layer_composite_apply(self, btn):
+        """Composite all enabled layers and push to hardware."""
+        btn.set_sensitive(False)
+        layers = self.layer_svc.load()
+        import time as _time
+        t = _time.monotonic()
+        frame_colors = [get_frame_colors(l, t) for l in layers]
+        final = self.compositor.composite(layers, frame_colors)
+        # Update UI to reflect composed colors
+        for i, c in enumerate(final):
+            self.zone_colors[i] = c
+            self.keyboard_visual.set_zone_color(i, c)
+            self.color_circles[i].set_color(c)
+        self._status("Compositing layers...")
+        def _do():
+            ok, err = self.service.apply_preset(final)
+            GLib.idle_add(btn.set_sensitive, True)
+            GLib.idle_add(self._status,
+                          "Layers applied!" if ok else f"Error: {err}", ok)
+        self._async(_do)

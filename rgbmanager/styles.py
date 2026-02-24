@@ -131,6 +131,92 @@ window { background-color: #0F0F23; }
     border-color: #7C3AED;
     color: #E2E8F0;
 }
+
+/* ============ Layers panel ============ */
+.layer-row {
+    background-color: #1A1338;
+    border-radius: 10px;
+    padding: 12px 14px;
+    border: 1px solid #2A2545;
+    margin-bottom: 6px;
+}
+.layer-row:hover {
+    border-color: #7C3AED;
+}
+.layer-name-lbl {
+    font-size: 13px;
+    font-weight: 600;
+    color: #E2E8F0;
+}
+.zone-mask-btn {
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 4px 8px;
+    min-width: 34px;
+    min-height: 28px;
+    background-color: #2A2545;
+    border: 1px solid #3A3560;
+    color: #64748B;
+}
+.zone-mask-btn:hover { border-color: #7C3AED; }
+.zone-mask-active {
+    background-color: #2D1B69;
+    border-color: #7C3AED;
+    color: #A78BFA;
+}
+.layer-apply-btn {
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 7px 16px;
+    background-color: #1B4D35;
+    border: 1px solid #22C55E;
+    color: #22C55E;
+}
+.layer-apply-btn:hover { background-color: #22C55E; color: #0F0F23; }
+.layer-apply-btn:disabled { opacity: 0.4; }
+.layer-del-btn {
+    border-radius: 6px;
+    font-size: 13px;
+    padding: 4px 10px;
+    min-height: 30px;
+    background-color: transparent;
+    border: 1px solid #3A2030;
+    color: #64748B;
+}
+.layer-del-btn:hover { border-color: #F85149; color: #F85149; }
+.layer-reorder-btn {
+    border-radius: 6px;
+    font-size: 13px;
+    padding: 4px 9px;
+    min-height: 30px;
+    background-color: transparent;
+    border: 1px solid #2A2545;
+    color: #64748B;
+    min-width: 32px;
+}
+.layer-reorder-btn:hover { border-color: #7C3AED; color: #A78BFA; }
+.layers-empty {
+    font-size: 12px;
+    color: #394157;
+    font-style: italic;
+}
+.blend-combo {
+    font-size: 11px;
+    color: #94A3B8;
+    border-radius: 6px;
+}
+.layer-save-btn {
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 7px 14px;
+    background-color: #2D1B69;
+    border: 1px solid #7C3AED;
+    color: #A78BFA;
+}
+.layer-save-btn:hover { background-color: #7C3AED; color: #fff; }
 """
 
 

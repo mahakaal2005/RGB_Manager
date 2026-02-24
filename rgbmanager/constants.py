@@ -24,6 +24,16 @@ ANIMATION_MODES = [
     ("disco",     "Disco",     "Fast RGB strobe"),
 ]
 
+# ── Blend modes for the layer compositor ──────────────────────────────────────
+BLEND_MODES = ["override", "blend", "add", "multiply", "screen"]
+BLEND_MODE_LABELS = {
+    "override": "Override",
+    "blend":    "Blend",
+    "add":      "Add",
+    "multiply": "Multiply",
+    "screen":   "Screen",
+}
+
 # ── Presets ────────────────────────────────────────────────────────────────────
 STATIC_PRESETS = {
     "Gaming":     ["FF0000", "FF0000", "FF0000", "FF0000"],
