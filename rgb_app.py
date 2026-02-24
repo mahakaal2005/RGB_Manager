@@ -63,8 +63,15 @@ C_SECOND   = (0.655, 0.545, 0.980)   # #A78BFA
 C_ACCENT   = (0.957, 0.247, 0.369)   # #F43F5E
 C_TEXT     = (0.886, 0.910, 0.941)   # #E2E8F0
 C_MUTED    = (0.392, 0.455, 0.545)   # #64748B
-C_GLOW_P   = (0.486, 0.227, 0.929, 0.35)
-C_GLOW_A   = (0.957, 0.247, 0.369, 0.35)
+
+# ── Knob geometry constants ───────────────────────────────────────────────────
+# Arc runs clockwise from bottom-left (135°) sweeping 270° to bottom-right.
+KNOB_START_A   = 0.75 * math.pi   # 135° — arc start angle
+KNOB_SWEEP     = 1.5  * math.pi   # 270° — total sweep
+KNOB_END_A     = KNOB_START_A + KNOB_SWEEP  # 405° — arc end angle
+KNOB_GAP_HALF  = 0.25 * math.pi   # dead-zone half-width around gap
+KNOB_LINE_W    = 6                 # arc stroke width (px)
+KNOB_DEBOUNCE  = 300               # ms before writing to sysfs
 
 def hex_to_rgb(h):
     h = h.lstrip("#")
@@ -157,20 +164,34 @@ window { background-color: #0F0F23; }
 }
 .status-bar {
     font-size: 10px;
-    color: #64748B;
+    color: #94A3B8;  /* was #64748B - raised to 4.5:1 contrast */
 }
 .status-ok  { color: #34D399; }
-.status-err { color: #F43F5E; }
+.status-err { color: #F85149; }
 .desc-label {
     font-size: 9px;
-    color: #64748B;
+    color: #94A3B8;
     font-style: italic;
 }
 .knob-label {
-    font-size: 9px;
+    font-size: 10px;
     font-weight: bold;
     color: #A78BFA;
     letter-spacing: 2px;
+}
+.dir-toggle {
+    border-radius: 50%;
+    font-size: 13px;
+    padding: 2px 6px;
+    background-color: #1E1840;
+    border: 1px solid #2A2545;
+    color: #64748B;
+    min-width: 28px;
+    min-height: 28px;
+}
+.dir-toggle:hover {
+    border-color: #7C3AED;
+    color: #A78BFA;
 }
 """
 
@@ -225,142 +246,168 @@ class RGBService:
 #  CIRCULAR KNOB WIDGET (Cairo)
 # ══════════════════════════════════════════════════════════════════════════════
 class CircularKnob(Gtk.DrawingArea):
-    """A circular arc knob drawn with Cairo. Click-and-drag to adjust value."""
+    """
+    A circular arc knob drawn with Cairo.
+
+    Design notes (senior dev):
+    - Uses named module-level constants (KNOB_*) instead of inline magic numbers.
+    - Observer list pattern: multiple callbacks can subscribe via on_change().
+    - clockwise=True  → arc fills left-to-right (standard)
+    - clockwise=False → arc fills right-to-left (reversed; frac is inverted)
+    - Sets Gdk pointer cursor on realize for correct cursor feedback.
+    """
 
     def __init__(self, min_val=0, max_val=255, value=100, label="",
-                 arc_color=C_PRIMARY, size=110, int_only=True):
+                 arc_color=C_PRIMARY, size=110, int_only=True, clockwise=True):
         super().__init__()
-        self.min_val = min_val
-        self.max_val = max_val
-        self._value = value
-        self.label = label
+        self.min_val   = min_val
+        self.max_val   = max_val
+        self._value    = value
+        self.label     = label
         self.arc_color = arc_color
-        self.size = size
-        self.int_only = int_only
-        self._dragging = False
-        self._callback = None
+        self.size      = size
+        self.int_only  = int_only
+        self.clockwise = clockwise
+        self._dragging   = False
+        self._callbacks  = []   # Observer list — supports multiple subscribers
 
-        self.set_size_request(size, size + 18)
+        self.set_size_request(size, size + 24)
         self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK |
             Gdk.EventMask.BUTTON_RELEASE_MASK |
             Gdk.EventMask.POINTER_MOTION_MASK |
-            Gdk.EventMask.SCROLL_MASK
+            Gdk.EventMask.SCROLL_MASK |
+            Gdk.EventMask.ENTER_NOTIFY_MASK
         )
-        self.connect("draw", self._on_draw)
-        self.connect("button-press-event", self._on_press)
+        self.connect("draw",                 self._on_draw)
+        self.connect("button-press-event",   self._on_press)
         self.connect("button-release-event", self._on_release)
-        self.connect("motion-notify-event", self._on_motion)
-        self.connect("scroll-event", self._on_scroll)
+        self.connect("motion-notify-event",  self._on_motion)
+        self.connect("scroll-event",         self._on_scroll)
+        self.connect("realize",              self._on_realize)
 
+    # ── Cursor feedback ────────────────────────────────────────────────────────
+    def _on_realize(self, widget):
+        cursor = Gdk.Cursor.new_from_name(self.get_display(), "pointer")
+        self.get_window().set_cursor(cursor)
+
+    # ── Value property ─────────────────────────────────────────────────────────
     @property
     def value(self):
         return self._value
 
     @value.setter
     def value(self, v):
-        self._value = max(self.min_val, min(self.max_val, v))
-        if self.int_only:
-            self._value = int(self._value)
+        clamped = max(self.min_val, min(self.max_val, v))
+        self._value = int(clamped) if self.int_only else clamped
         self.queue_draw()
 
+    # ── Observer pattern ───────────────────────────────────────────────────────
     def on_change(self, callback):
-        self._callback = callback
+        """Register a callback. Multiple subscribers supported."""
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
 
     def _emit_change(self):
-        if self._callback:
-            self._callback(self._value)
+        for cb in self._callbacks:
+            cb(self._value)
 
-    def _angle_from_value(self, v):
-        frac = (v - self.min_val) / (self.max_val - self.min_val)
-        return -0.75 * math.pi + frac * 1.5 * math.pi  # 225° sweep from bottom-left
+    # ── Internal geometry ──────────────────────────────────────────────────────
+    def _frac(self):
+        """Normalised 0..1 position, accounting for CW/CCW direction."""
+        raw = (self._value - self.min_val) / (self.max_val - self.min_val)
+        return raw if self.clockwise else 1.0 - raw
 
-    def _value_from_angle(self, angle):
-        # Normalize angle to our arc range
-        start = -0.75 * math.pi
-        frac = (angle - start) / (1.5 * math.pi)
-        frac = max(0, min(1, frac))
-        return self.min_val + frac * (self.max_val - self.min_val)
+    def _val_angle(self):
+        """Cairo angle of the handle dot."""
+        return KNOB_START_A + self._frac() * KNOB_SWEEP
 
+    # ── Drawing ────────────────────────────────────────────────────────────────
     def _on_draw(self, widget, cr):
-        w = self.get_allocated_width()
-        h = self.get_allocated_height()
+        w  = self.get_allocated_width()
+        h  = self.get_allocated_height()
         cx = w / 2
-        cy = (h - 18) / 2
-        r = min(cx, cy) - 8
+        cy = (h - 24) / 2
+        r  = min(cx, cy) - 8
 
-        line_w = 6
-        start_a = 0.75 * math.pi  # 135° (bottom-left)
-        end_a = 2.25 * math.pi    # 405° (bottom-right, wrapping)
-        val_a = start_a + ((self._value - self.min_val) / (self.max_val - self.min_val)) * 1.5 * math.pi
+        val_a = self._val_angle()
 
-        # Background track
-        cr.set_line_width(line_w)
+        # Background track (full arc)
+        cr.set_line_width(KNOB_LINE_W)
         cr.set_source_rgba(0.15, 0.12, 0.25, 1)
-        cr.arc(cx, cy, r, start_a, end_a)
+        cr.arc(cx, cy, r, KNOB_START_A, KNOB_END_A)
         cr.stroke()
 
-        # Value arc (with glow)
-        # Glow
-        cr.set_line_width(line_w + 6)
-        cr.set_source_rgba(*self.arc_color, 0.2)
-        cr.arc(cx, cy, r, start_a, val_a)
+        # Value arc glow
+        cr.set_line_width(KNOB_LINE_W + 6)
+        cr.set_source_rgba(*self.arc_color, 0.18)
+        if self.clockwise:
+            cr.arc(cx, cy, r, KNOB_START_A, val_a)
+        else:
+            cr.arc_negative(cx, cy, r, val_a, KNOB_START_A)
         cr.stroke()
-        # Main arc
-        cr.set_line_width(line_w)
+
+        # Value arc solid
+        cr.set_line_width(KNOB_LINE_W)
         cr.set_source_rgba(*self.arc_color, 1)
-        cr.arc(cx, cy, r, start_a, val_a)
+        if self.clockwise:
+            cr.arc(cx, cy, r, KNOB_START_A, val_a)
+        else:
+            cr.arc_negative(cx, cy, r, val_a, KNOB_START_A)
         cr.stroke()
 
-        # Handle dot
+        # Handle dot (glow then core)
         hx = cx + r * math.cos(val_a)
         hy = cy + r * math.sin(val_a)
-        # Glow
         cr.set_source_rgba(*self.arc_color, 0.4)
         cr.arc(hx, hy, 8, 0, 2 * math.pi)
         cr.fill()
-        # Dot
         cr.set_source_rgba(*C_TEXT, 1)
         cr.arc(hx, hy, 5, 0, 2 * math.pi)
         cr.fill()
 
-        # Value text in center
+        # Centre value text
         val_str = str(int(self._value)) if self.int_only else f"{self._value:.1f}"
         cr.set_source_rgba(*C_TEXT, 1)
         cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
         cr.set_font_size(18)
         ext = cr.text_extents(val_str)
-        cr.move_to(cx - ext.width/2, cy + ext.height/2)
+        cr.move_to(cx - ext.width / 2, cy + ext.height / 2)
         cr.show_text(val_str)
 
-        # Label below
+        # Direction indicator (↻ CW / ↺ CCW) drawn inside arc
+        indicator = "\u21bb" if self.clockwise else "\u21ba"
+        cr.set_source_rgba(*self.arc_color, 0.7)
+        cr.set_font_size(11)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        ext2 = cr.text_extents(indicator)
+        cr.move_to(cx - ext2.width / 2, cy + r * 0.45)
+        cr.show_text(indicator)
+
+        # Range label below knob body
         if self.label:
             cr.set_source_rgba(*C_MUTED, 1)
             cr.set_font_size(9)
+            cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
             ext = cr.text_extents(self.label)
-            cr.move_to(cx - ext.width/2, h - 4)
+            cr.move_to(cx - ext.width / 2, h - 5)
             cr.show_text(self.label)
 
-    def _get_angle(self, x, y):
-        w = self.get_allocated_width()
-        h = self.get_allocated_height()
-        cx = w / 2
-        cy = (h - 18) / 2
-        angle = math.atan2(y - cy, x - cx)
-        # Normalize to 0..2pi
-        if angle < 0:
-            angle += 2 * math.pi
-        return angle
+    # ── Interaction ────────────────────────────────────────────────────────────
+    def _get_raw_angle(self, x, y):
+        w, h = self.get_allocated_width(), self.get_allocated_height()
+        cx, cy = w / 2, (h - 24) / 2
+        a = math.atan2(y - cy, x - cx)
+        return a + 2 * math.pi if a < 0 else a
 
     def _update_from_event(self, x, y):
-        angle = self._get_angle(x, y)
-        start_a = 0.75 * math.pi
-        # Map angle into [start_a, start_a + 1.5pi]
-        rel = angle - start_a
-        if rel < -0.25 * math.pi:
+        angle = self._get_raw_angle(x, y)
+        rel = angle - KNOB_START_A
+        if rel < -KNOB_GAP_HALF:
             rel += 2 * math.pi
-        frac = rel / (1.5 * math.pi)
-        frac = max(0, min(1, frac))
+        frac = max(0.0, min(1.0, rel / KNOB_SWEEP))
+        if not self.clockwise:
+            frac = 1.0 - frac
         self.value = self.min_val + frac * (self.max_val - self.min_val)
         self._emit_change()
 
@@ -378,11 +425,17 @@ class CircularKnob(Gtk.DrawingArea):
 
     def _on_scroll(self, w, ev):
         step = 1 if self.int_only else 0.5
-        if ev.direction == Gdk.ScrollDirection.UP:
-            self.value = self._value + step
-        elif ev.direction == Gdk.ScrollDirection.DOWN:
-            self.value = self._value - step
+        delta = step if ev.direction == Gdk.ScrollDirection.UP else -step
+        if not self.clockwise:
+            delta = -delta
+        self.value = self._value + delta
         self._emit_change()
+
+    def toggle_direction(self):
+        """Flip CW ↔ CCW. Bind to a button."""
+        self.clockwise = not self.clockwise
+        self.queue_draw()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -623,6 +676,23 @@ class RGBManagerApp(Gtk.Application):
                 ctx.remove_class("mode-active")
                 ctx.add_class("mode-btn")
 
+    def _debounce(self, timer_attr: str, fn, *args):
+        """
+        Debounce helper — eliminates the copy-paste timer pattern.
+        Cancels any pending GLib timeout stored in `timer_attr` and
+        schedules `fn(*args)` to fire after KNOB_DEBOUNCE ms.
+        """
+        existing = getattr(self, timer_attr, None)
+        if existing:
+            GLib.source_remove(existing)
+
+        def _fire():
+            setattr(self, timer_attr, None)
+            fn(*args)
+            return False
+
+        setattr(self, timer_attr, GLib.timeout_add(KNOB_DEBOUNCE, _fire))
+
     # ── Build UI ──────────────────────────────────────────────────────────────
     def do_activate(self):
         self._apply_css()
@@ -631,12 +701,17 @@ class RGBManagerApp(Gtk.Application):
         win.set_default_size(860, 620)
         win.set_resizable(True)
 
+        # ScrolledWindow makes the layout safe for any window size
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        win.add(scroll)
+
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         outer.set_margin_top(16)
         outer.set_margin_bottom(12)
         outer.set_margin_start(16)
         outer.set_margin_end(16)
-        win.add(outer)
+        scroll.add(outer)
 
         # Header
         outer.pack_start(self._build_header(), False, False, 0)
@@ -644,7 +719,7 @@ class RGBManagerApp(Gtk.Application):
 
         # Main two-column layout
         columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        columns.pack_start(self._build_left_panel(), True, True, 0)
+        columns.pack_start(self._build_left_panel(), False, False, 0)
         columns.pack_start(self._build_right_panel(), True, True, 0)
         outer.pack_start(columns, True, True, 0)
 
@@ -745,40 +820,55 @@ class RGBManagerApp(Gtk.Application):
     def _build_right_panel(self):
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
 
-        # Knobs row
+        # Knobs row card — each knob has a label + knob + direction toggle button
         knobs_card = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
         knobs_card.get_style_context().add_class("card")
         knobs_card.set_halign(Gtk.Align.CENTER)
 
+        def _make_knob_box(lbl_text, knob_widget):
+            """Build a Vertical box: Label / Knob / Direction-toggle button"""
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            lbl = Gtk.Label(label=lbl_text)
+            lbl.get_style_context().add_class("knob-label")
+
+            # Direction toggle button  (↻ CW / ↺ CCW)
+            dir_btn = Gtk.Button(label="\u21bb CW")
+            dir_btn.get_style_context().add_class("dir-toggle")
+            dir_btn.set_halign(Gtk.Align.CENTER)
+            dir_btn.set_tooltip_text("Toggle knob direction (CW ⇔ CCW)")
+
+            def _on_dir_toggle(b, knob=knob_widget, btn=dir_btn):
+                knob.toggle_direction()
+                btn.set_label("\u21bb CW" if knob.clockwise else "\u21ba CCW")
+
+            dir_btn.connect("clicked", _on_dir_toggle)
+
+            box.pack_start(lbl,        False, False, 0)
+            box.pack_start(knob_widget, False, False, 0)
+            box.pack_start(dir_btn,    False, False, 0)
+            return box
+
         # Brightness knob
-        bright_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        bright_lbl = Gtk.Label(label="BRIGHTNESS")
-        bright_lbl.get_style_context().add_class("knob-label")
         self.brightness_knob = CircularKnob(
             min_val=0, max_val=255, value=100,
             label="0 — 255", arc_color=C_PRIMARY, size=110
         )
         self.brightness_knob.on_change(self._on_brightness_knob)
-        bright_box.pack_start(bright_lbl, False, False, 0)
-        bright_box.pack_start(self.brightness_knob, False, False, 0)
-        knobs_card.pack_start(bright_box, False, False, 10)
+        knobs_card.pack_start(_make_knob_box("BRIGHTNESS", self.brightness_knob), False, False, 10)
 
         # Speed knob
-        speed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        speed_lbl = Gtk.Label(label="SPEED")
-        speed_lbl.get_style_context().add_class("knob-label")
         self.speed_knob = CircularKnob(
             min_val=1, max_val=10, value=1,
             label="1 — 10", arc_color=C_ACCENT, size=110
         )
         self.speed_knob.on_change(self._on_speed_knob)
-        speed_box.pack_start(speed_lbl, False, False, 0)
-        speed_box.pack_start(self.speed_knob, False, False, 0)
-        knobs_card.pack_start(speed_box, False, False, 10)
+        knobs_card.pack_start(_make_knob_box("SPEED", self.speed_knob), False, False, 10)
 
         panel.pack_start(knobs_card, False, False, 0)
 
         # Animation Mode card
+        # Use Gtk.Grid (fixed 2x5) instead of FlowBox to prevent reflow
+        # when the active mode's border/style changes button rendered width.
         anim_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         anim_card.get_style_context().add_class("card")
         anim_card.pack_start(self._sec("ANIMATION MODE"), False, False, 0)
@@ -788,23 +878,23 @@ class RGBManagerApp(Gtk.Application):
         self.mode_desc_lbl.get_style_context().add_class("desc-label")
         anim_card.pack_start(self.mode_desc_lbl, False, False, 0)
 
-        flow = Gtk.FlowBox()
-        flow.set_max_children_per_line(5)
-        flow.set_selection_mode(Gtk.SelectionMode.NONE)
-        flow.set_column_spacing(4)
-        flow.set_row_spacing(4)
-        flow.set_homogeneous(True)
-        for key, label, desc in ANIMATION_MODES:
+        COLS = 5  # Fixed 2×5 grid — never reflows
+        grid = Gtk.Grid()
+        grid.set_column_spacing(4)
+        grid.set_row_spacing(4)
+        grid.set_column_homogeneous(True)  # All columns same width
+        for i, (key, label, desc) in enumerate(ANIMATION_MODES):
             btn = Gtk.Button(label=label)
+            btn.set_hexpand(True)
             ctx = btn.get_style_context()
             ctx.add_class("mode-btn")
             if key == "static":
                 ctx.add_class("mode-active")
                 ctx.remove_class("mode-btn")
             btn.connect("clicked", self._on_mode_click, key, desc)
-            flow.add(btn)
+            grid.attach(btn, i % COLS, i // COLS, 1, 1)
             self._mode_buttons[key] = btn
-        anim_card.pack_start(flow, False, False, 0)
+        anim_card.pack_start(grid, False, False, 0)
         panel.pack_start(anim_card, False, False, 0)
 
         # Dynamic Presets card
@@ -867,15 +957,8 @@ class RGBManagerApp(Gtk.Application):
 
     # ── Knob callbacks ────────────────────────────────────────────────────────
     def _on_brightness_knob(self, v):
-        if self._brightness_timer:
-            GLib.source_remove(self._brightness_timer)
-        self._brightness_timer = GLib.timeout_add(300, self._fire_brightness, int(v))
-
-    def _fire_brightness(self, v):
-        self._brightness_timer = None
-        self._status(f"Brightness → {v} …")
-        self._async(self._do_brightness, v)
-        return False
+        self._status(f"Brightness → {int(v)} …")
+        self._debounce("_brightness_timer", self._do_brightness, int(v))
 
     def _do_brightness(self, v):
         ok, err = self.service.set_brightness(v)
@@ -883,15 +966,8 @@ class RGBManagerApp(Gtk.Application):
 
     def _on_speed_knob(self, v):
         self.current_speed = int(v)
-        if self._speed_timer:
-            GLib.source_remove(self._speed_timer)
-        self._speed_timer = GLib.timeout_add(300, self._fire_speed, int(v))
-
-    def _fire_speed(self, v):
-        self._speed_timer = None
-        self._status(f"Speed → {v} …")
-        self._async(self._do_speed, v)
-        return False
+        self._status(f"Speed → {int(v)} …")
+        self._debounce("_speed_timer", self._do_speed, int(v))
 
     def _do_speed(self, v):
         ok, err = self.service.set_speed(v)

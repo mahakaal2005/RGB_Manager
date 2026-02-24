@@ -4,4 +4,5 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-/usr/bin/python3 "$SCRIPT_DIR/rgb_app.py"
+# Launch as Python package (modular layout under rgbmanager/)
+cd "$SCRIPT_DIR" && /usr/bin/python3 -m rgbmanager
