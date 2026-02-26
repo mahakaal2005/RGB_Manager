@@ -2,7 +2,9 @@
 # One-time setup: allows the RGB Manager to write to sysfs without a password prompt.
 # Adds a sudoers rule so 'sudo /usr/bin/tee /sys/.../rgb_zones/*' requires no password.
 
-RULE='mahakaal ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/devices/platform/omen-rgb-keyboard/rgb_zones/*'
+
+REAL_USER=${SUDO_USER:-$USER}
+RULE="${REAL_USER} ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/devices/platform/omen-rgb-keyboard/rgb_zones/*"
 DEST='/etc/sudoers.d/rgb-keyboard'
 
 echo "Installing sudoers rule to $DEST ..."
