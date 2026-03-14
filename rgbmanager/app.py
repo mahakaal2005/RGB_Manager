@@ -46,6 +46,8 @@ class RGBManagerApp(Gtk.Application):
         # Layer UI state
         self._layers_list_box  = None  # Gtk.ListBox ref
         self._layer_apply_btn  = None  # The composite+apply button
+        self._consecutive_failures = 0  # Track repeated write failures
+        self._reload_btn       = None  # Header reload button ref
 
     # ── Background tasks ───────────────────────────────────────────────────────
     def _async(self, fn, *args):
@@ -139,6 +141,9 @@ class RGBManagerApp(Gtk.Application):
 
         win.show_all()
 
+        # Run startup health check in background — don't block the UI from opening
+        self._async(self._startup_health_check)
+
     # ── Layout helpers ─────────────────────────────────────────────────────────
     def _vspace(self, px):
         b = Gtk.Box()
@@ -162,6 +167,16 @@ class RGBManagerApp(Gtk.Application):
         left.pack_start(t, False, False, 0)
         left.pack_start(s, False, False, 0)
         box.pack_start(left, True, True, 0)
+
+        # Reload Driver button — visible escape hatch for stuck driver
+        self._reload_btn = Gtk.Button(label="\U0001f504 Reload Driver")
+        self._reload_btn.get_style_context().add_class("reload-btn")
+        self._reload_btn.set_tooltip_text(
+            "Reload the omen_rgb_keyboard kernel module.\n"
+            "Use this if your keyboard stops responding after waking from sleep."
+        )
+        self._reload_btn.connect("clicked", self._on_reload_driver)
+        box.pack_start(self._reload_btn, False, False, 0)
         return box
 
     # ── Left Panel ─────────────────────────────────────────────────────────────
@@ -456,6 +471,58 @@ class RGBManagerApp(Gtk.Application):
     def do_quit(self):
         self.anim_loop.stop()
         super().do_quit()
+
+    # ── Startup health check ───────────────────────────────────────────────────
+    def _startup_health_check(self):
+        """Run in background once the window appears. Auto-recovers a stuck driver."""
+        GLib.idle_add(self._status, "Checking driver health...")
+        ok, _err = self.service.health_check()
+        if ok:
+            GLib.idle_add(self._status, "Driver OK — keyboard ready.", True)
+            return
+
+        # Driver is stuck — attempt automatic reload
+        GLib.idle_add(self._status, "Driver stuck — reloading kernel module...", False)
+        if self._reload_btn:
+            GLib.idle_add(self._reload_btn.set_sensitive, False)
+
+        ok, err = self.service.reload_module()
+        if not ok:
+            msg = f"Auto-reload failed: {err}. Click 🔄 Reload Driver to retry."
+            GLib.idle_add(self._status, msg, False)
+            if self._reload_btn:
+                GLib.idle_add(self._reload_btn.set_sensitive, True)
+            return
+
+        ok, err = self.service.reapply_last_state()
+        if self._reload_btn:
+            GLib.idle_add(self._reload_btn.set_sensitive, True)
+        if ok:
+            GLib.idle_add(self._status, "Driver reloaded — settings restored.", True)
+        else:
+            GLib.idle_add(self._status, f"Driver reloaded but restore failed: {err}", False)
+
+    # ── Manual reload driver ───────────────────────────────────────────────────
+    def _on_reload_driver(self, btn):
+        """Clicked by user — reload module and restore last keyboard state."""
+        btn.set_sensitive(False)
+        self._status("Reloading kernel module...")
+
+        def _do():
+            ok, err = self.service.reload_module()
+            if not ok:
+                GLib.idle_add(btn.set_sensitive, True)
+                GLib.idle_add(self._status, f"Reload failed: {err}", False)
+                return
+            ok, err = self.service.reapply_last_state()
+            self._consecutive_failures = 0
+            GLib.idle_add(btn.set_sensitive, True)
+            if ok:
+                GLib.idle_add(self._status, "Driver reloaded — keyboard restored.", True)
+            else:
+                GLib.idle_add(self._status, f"Reloaded, but restore failed: {err}", False)
+
+        self._async(_do)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  Layers panel

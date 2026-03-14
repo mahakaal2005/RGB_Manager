@@ -5,6 +5,7 @@ All hardware writes go through RGBService. Nothing in this module
 imports from widgets or app layers (dependency flows one way).
 """
 import subprocess
+import time
 from .constants import SYSFS_BASE
 
 
@@ -153,3 +154,59 @@ class RGBService:
         if not ok:
             return (False, err)
         return self.set_speed(speed)
+
+    # ── Module health & recovery ────────────────────────────────────────────
+
+    def health_check(self) -> tuple[bool, str]:
+        """
+        Test whether sysfs writes succeed. Reads the current brightness and
+        writes it back — a no-op that confirms the driver is alive.
+        Returns (True, '') if healthy, (False, error_message) if stuck.
+        """
+        current = self._read("brightness", "100")
+        return self._write("brightness", current)
+
+    def reload_module(self) -> tuple[bool, str]:
+        """
+        Remove and reload the omen_rgb_keyboard kernel module.
+        Requires passwordless sudo on modprobe (set up by install_sudoers.sh
+        or add 'NOPASSWD: /sbin/modprobe' to the sudoers rule).
+        """
+        try:
+            # Remove (ignore error if module was already unloaded)
+            subprocess.run(
+                ["sudo", "/sbin/modprobe", "-r", "omen_rgb_keyboard"],
+                capture_output=True, timeout=10,
+            )
+            time.sleep(1)
+            # Load
+            proc = subprocess.run(
+                ["sudo", "/sbin/modprobe", "omen_rgb_keyboard"],
+                capture_output=True, timeout=10,
+            )
+            if proc.returncode != 0:
+                return (False, proc.stderr.decode().strip() or "modprobe failed")
+            time.sleep(1)  # Give the driver a moment to create sysfs nodes
+            return (True, "")
+        except Exception as e:
+            return (False, str(e))
+
+    def reapply_last_state(self) -> tuple[bool, str]:
+        """
+        Read the last known state from the kernel state file and push it
+        back to hardware. Call this after reload_module() to restore settings.
+        """
+        state = self.read_state()
+        # Restore zone colors
+        ok, err = self.apply_preset(state["zones"])
+        if not ok:
+            return (False, err)
+        # Restore brightness
+        ok, err = self.set_brightness(state["brightness"])
+        if not ok:
+            return (False, err)
+        # Restore animation mode and speed
+        ok, err = self.set_animation(state["mode"])
+        if not ok:
+            return (False, err)
+        return self.set_speed(state["speed"])

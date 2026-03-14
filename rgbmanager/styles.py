@@ -87,6 +87,17 @@ window { background-color: #0F0F23; }
     border: none;
 }
 .set-all-btn:hover { background-color: #A78BFA; }
+.reload-btn {
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 7px 16px;
+    background-color: #1C1500;
+    border: 1px solid #D97706;
+    color: #FBBF24;
+}
+.reload-btn:hover { background-color: #D97706; color: #0F0F23; }
+.reload-btn:disabled { opacity: 0.4; }
 .status-bar {
     font-size: 11px;
     color: #94A3B8;
