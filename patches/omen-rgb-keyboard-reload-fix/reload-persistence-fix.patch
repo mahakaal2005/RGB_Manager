@@ -1,0 +1,106 @@
+diff --git a/src/core/omen_rgb_keyboard_main.c b/src/core/omen_rgb_keyboard_main.c
+index 1002103..33379c0 100644
+--- a/src/core/omen_rgb_keyboard_main.c
++++ b/src/core/omen_rgb_keyboard_main.c
+@@ -35,17 +35,29 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
+ 	
+ 	/* Initialize animation system */
+ 	animation_init();
+-	
+-	/* Load saved state */
+-	load_animation_state();
+-	
+-	/* Setup zones and create sysfs attributes */
++
++	/*
++	 * Setup zones and create sysfs attributes first. fourzone_setup()
++	 * does an initial hardware readback into original_colors[]; that
++	 * value is provisional and gets replaced below once we know the
++	 * real saved colors.
++	 */
+ 	ret = fourzone_setup(device);
+ 	if (ret) {
+ 		animation_cleanup();
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Load saved state (must run after fourzone_setup so its hardware
++	 * readback doesn't clobber the restored original_colors/brightness),
++	 * then push the restored brightness/colors out to hardware — the
++	 * physical LEDs were forced off during unload and don't reflect the
++	 * loaded state until we write it out explicitly.
++	 */
++	load_animation_state();
++	omen_apply_brightness(global_brightness);
++
+ 	ret = devm_led_classdev_register(&device->dev, &omen_kbd_led);
+ 	if (ret)
+ 		pr_warn("Failed to register keyboard LED classdev: %d\n", ret);
+@@ -116,6 +128,9 @@ module_init(hp_wmi_init);
+ 
+ static void __exit hp_wmi_exit(void)
+ {
++	/* Mark unload so the LED core's shutdown brightness=0 write isn't saved */
++	driver_unloading = true;
++
+ 	/* Cleanup HDA LED control */
+ 	omen_hda_led_cleanup();
+ 	
+diff --git a/src/include/omen_zones.h b/src/include/omen_zones.h
+index 886523e..0cb1f36 100644
+--- a/src/include/omen_zones.h
++++ b/src/include/omen_zones.h
+@@ -37,6 +37,17 @@ extern struct platform_zone original_colors[ZONE_COUNT];
+ extern int global_brightness;
+ extern struct led_classdev omen_kbd_led;
+ 
++/*
++ * Set to true at the start of driver unload. The devm-managed LED classdev
++ * unregister (triggered by platform_device_unregister in hp_wmi_exit) forces
++ * brightness to 0 via the LED core's shutdown path; this flag stops that
++ * transient value from being persisted over the real saved state.
++ */
++extern bool driver_unloading;
++
++/* Scale original_colors[] by level%, write to hardware, and save state. */
++int omen_apply_brightness(unsigned long level);
++
+ /**
+  * parse_rgb - Parse hex RGB color string into platform_zone
+  * @buf: Input buffer containing hex color (e.g., "FF0000")
+diff --git a/src/zones/omen_zones.c b/src/zones/omen_zones.c
+index bfdb5f8..eabf91a 100644
+--- a/src/zones/omen_zones.c
++++ b/src/zones/omen_zones.c
+@@ -30,6 +30,7 @@ static struct platform_device *zone_platform_dev;
+ 
+ struct platform_zone original_colors[ZONE_COUNT];
+ int global_brightness = 100;
++bool driver_unloading = false;
+ 
+ struct led_classdev omen_kbd_led;
+ 
+@@ -113,7 +114,7 @@ void update_all_zones_with_colors(struct color_platform colors[ZONE_COUNT])
+ 	}
+ }
+ 
+-static int omen_apply_brightness(unsigned long level)
++int omen_apply_brightness(unsigned long level)
+ {
+ 	int ret;
+ 
+@@ -132,7 +133,12 @@ static int omen_apply_brightness(unsigned long level)
+ 			return ret;
+ 	}
+ 
+-	save_animation_state();
++	/*
++	 * Don't persist the LED-core's shutdown-time brightness=0 write
++	 * (see driver_unloading in omen_zones.h) over the real saved state.
++	 */
++	if (!driver_unloading)
++		save_animation_state();
+ 	return 0;
+ }
+ 
