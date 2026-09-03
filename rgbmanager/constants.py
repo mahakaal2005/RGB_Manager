@@ -8,6 +8,17 @@ import math
 
 # ── Hardware path ──────────────────────────────────────────────────────────────
 SYSFS_BASE = "/sys/devices/platform/omen-rgb-keyboard/rgb_zones"
+FAN_SYSFS_BASE = "/sys/devices/platform/omen-rgb-keyboard/fan"
+
+# ── Fan control ─────────────────────────────────────────────────────────────────
+THERMAL_PROFILES = [
+    ("silent",      "Silent"),
+    ("normal",      "Normal"),
+    ("performance", "Performance"),
+]
+FAN_CURVE_MAX_POINTS = 8
+FAN_CURVE_MIN_POINTS = 2
+FAN_RPM_POLL_MS = 2000
 
 # ── Animation modes (from kernel source: omen_animations.c) ───────────────────
 # Each entry: (sysfs_key, display_label, description)

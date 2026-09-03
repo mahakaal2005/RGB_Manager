@@ -13,13 +13,17 @@ from .constants import (
     ANIMATION_MODES, STATIC_PRESETS, DYNAMIC_PRESETS,
     BLEND_MODES, BLEND_MODE_LABELS,
     C_PRIMARY, C_ACCENT, KNOB_DEBOUNCE,
+    THERMAL_PROFILES, FAN_CURVE_MAX_POINTS, FAN_RPM_POLL_MS,
 )
 from .service        import RGBService
+from .fan_service    import FanService
 from .layer_service  import LayerService, default_layer
 from .compositor     import LayerCompositor
 from .animator       import AnimationLoop, get_frame_colors
 from .widgets        import CircularKnob, KeyboardVisual, ColorCircle
 from .styles         import apply_css
+
+DEFAULT_FAN_CURVE = [(40, 30), (55, 45), (70, 65), (85, 90)]
 
 
 class RGBManagerApp(Gtk.Application):
@@ -28,11 +32,25 @@ class RGBManagerApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="dev.omen.rgb-manager")
         self.service     = RGBService()
+        self.fan_service = FanService()
         self.layer_svc   = LayerService()
         self.compositor  = LayerCompositor()
         self.anim_loop   = AnimationLoop(self.compositor, self.service)
         self._brightness_timer = None
         self._speed_timer = None
+
+        # Fan UI state
+        fan_state = self.fan_service.read_state()
+        self._fan_thermal_profile = fan_state["thermal_profile"]
+        self._fan_curve_points    = fan_state["curve"] or list(DEFAULT_FAN_CURVE)
+        self._fan_profile_buttons = {}
+        self._fan_points_box      = None
+        self._fan_curve_rows      = []   # list of (temp_spin, pct_spin, row_widget)
+        self._fan_rpm_timer       = None
+        self.cpu_rpm_lbl          = None
+        self.gpu_rpm_lbl          = None
+        self.fan_speed_knob       = None
+        self._fan_boost_active    = False  # tracks max_fan state; drives the knob threshold
 
         # Read live keyboard state from sysfs before building the UI
         state = self.service.read_state()
@@ -106,33 +124,29 @@ class RGBManagerApp(Gtk.Application):
         win.set_default_size(900, 660)
         win.set_resizable(True)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        win.add(scroll)
+        # Top-level vertical box: header, tabbed content, status bar (shared across tabs)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        win.add(root)
 
-        # Centering wrapper for horizontal expansion
-        alignment_wrapper = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        alignment_wrapper.pack_start(Gtk.Box(), True, True, 0) # Left spring
+        header_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header_wrap.set_margin_top(24)
+        header_wrap.set_margin_start(24); header_wrap.set_margin_end(24)
+        header_wrap.pack_start(self._build_header(), False, False, 0)
+        root.pack_start(header_wrap, False, False, 0)
+        root.pack_start(self._vspace(16), False, False, 0)
 
-        # Main content box (constrained width)
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        outer.set_size_request(880, -1)
-        outer.set_margin_top(24);    outer.set_margin_bottom(24)
-        alignment_wrapper.pack_start(outer, False, False, 0)
+        notebook = Gtk.Notebook()
+        notebook.set_hexpand(True); notebook.set_vexpand(True)
+        notebook.append_page(self._build_lighting_tab(), Gtk.Label(label="Lighting"))
+        notebook.append_page(self._build_fan_tab(),      Gtk.Label(label="Fan Control"))
+        notebook.connect("switch-page", self._on_tab_switched)
+        root.pack_start(notebook, True, True, 0)
 
-        alignment_wrapper.pack_start(Gtk.Box(), True, True, 0) # Right spring
-        scroll.add(alignment_wrapper)
-
-        outer.pack_start(self._build_header(),        False, False, 0)
-        outer.pack_start(self._vspace(16),            False, False, 0)
-
-        columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
-        columns.pack_start(self._build_left_panel(),  False, False, 0)
-        columns.pack_start(self._build_right_panel(), True,  True,  0)
-        outer.pack_start(columns, True, True, 0)
-
-        outer.pack_start(self._vspace(12),            False, False, 0)
-        outer.pack_start(self._build_status_bar(),    False, False, 0)
+        status_wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        status_wrap.set_margin_top(12); status_wrap.set_margin_bottom(24)
+        status_wrap.set_margin_start(24); status_wrap.set_margin_end(24)
+        status_wrap.pack_start(self._build_status_bar(), False, False, 0)
+        root.pack_start(status_wrap, False, False, 0)
 
         # Start animation loop (Phase 2: replaces kernel timer)
         layers = self.layer_svc.load()
@@ -155,6 +169,37 @@ class RGBManagerApp(Gtk.Application):
         lbl.set_halign(Gtk.Align.START)
         lbl.get_style_context().add_class("section-label")
         return lbl
+
+    # ── Tabs ───────────────────────────────────────────────────────────────────
+    def _build_lighting_tab(self):
+        """Original keyboard/RGB content, now living in the 'Lighting' notebook tab."""
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        alignment_wrapper = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        alignment_wrapper.pack_start(Gtk.Box(), True, True, 0)  # Left spring
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.set_size_request(880, -1)
+        outer.set_margin_top(20); outer.set_margin_bottom(20)
+        alignment_wrapper.pack_start(outer, False, False, 0)
+
+        alignment_wrapper.pack_start(Gtk.Box(), True, True, 0)  # Right spring
+        scroll.add(alignment_wrapper)
+
+        columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=24)
+        columns.pack_start(self._build_left_panel(),  False, False, 0)
+        columns.pack_start(self._build_right_panel(), True,  True,  0)
+        outer.pack_start(columns, True, True, 0)
+
+        return scroll
+
+    def _on_tab_switched(self, notebook, page, page_num):
+        """Fan RPM polling only runs while the Fan Control tab is visible."""
+        if page_num == 1:
+            self._start_fan_rpm_polling()
+        else:
+            self._stop_fan_rpm_polling()
 
     # ── Header ─────────────────────────────────────────────────────────────────
     def _build_header(self):
@@ -470,6 +515,7 @@ class RGBManagerApp(Gtk.Application):
     # ── Application quit ───────────────────────────────────────────────────────
     def do_quit(self):
         self.anim_loop.stop()
+        self._stop_fan_rpm_polling()
         super().do_quit()
 
     # ── Startup health check ───────────────────────────────────────────────────
@@ -757,4 +803,296 @@ class RGBManagerApp(Gtk.Application):
             GLib.idle_add(btn.set_sensitive, True)
             GLib.idle_add(self._status,
                           "Layers applied!" if ok else f"Error: {err}", ok)
+        self._async(_do)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Fan Control tab
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _build_fan_tab(self):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        alignment_wrapper = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        alignment_wrapper.pack_start(Gtk.Box(), True, True, 0)  # Left spring
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        outer.set_size_request(600, -1)
+        outer.set_margin_top(20); outer.set_margin_bottom(20)
+        alignment_wrapper.pack_start(outer, False, False, 0)
+
+        alignment_wrapper.pack_start(Gtk.Box(), True, True, 0)  # Right spring
+        scroll.add(alignment_wrapper)
+
+        outer.pack_start(self._build_fan_readout_card(),  False, False, 0)
+        outer.pack_start(self._build_fan_profile_card(),  False, False, 0)
+        outer.pack_start(self._build_fan_curve_card(),    False, False, 0)
+
+        return scroll
+
+    # ── Live readout ───────────────────────────────────────────────────────────
+    def _build_fan_readout_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("card")
+        card.pack_start(self._sec("LIVE READOUT"), False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=40)
+        row.set_halign(Gtk.Align.CENTER)
+
+        def _stat_box(title):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_halign(Gtk.Align.CENTER)
+            val = Gtk.Label(label="—")
+            val.get_style_context().add_class("rpm-value")
+            unit = Gtk.Label(label=f"{title} RPM")
+            unit.get_style_context().add_class("rpm-unit")
+            box.pack_start(val, False, False, 0)
+            box.pack_start(unit, False, False, 0)
+            return box, val
+
+        cpu_box, self.cpu_rpm_lbl = _stat_box("CPU")
+        gpu_box, self.gpu_rpm_lbl = _stat_box("GPU")
+        row.pack_start(cpu_box, False, False, 0)
+        row.pack_start(gpu_box, False, False, 0)
+        card.pack_start(row, False, False, 4)
+
+        # Fan boost knob. NOTE: this hardware's fan_curve_enable is confirmed broken
+        # (always ENODEV, verified across many curve variants) — max_fan is the only
+        # lever that reliably changes real fan speed. So this knob is a threshold
+        # switch, not true variable speed: below 50 = idle, 50+ = max boost. Releasing
+        # boost reloads the kernel module, since that's the only proven way to hand
+        # control back after max_fan leaves the EC with no active governor.
+        knob_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        knob_row.set_halign(Gtk.Align.CENTER)
+        knob_lbl = Gtk.Label(label="FAN BOOST")
+        knob_lbl.get_style_context().add_class("knob-label")
+        self.fan_speed_knob = CircularKnob(
+            min_val=0, max_val=100, value=0,
+            label="< 50 idle / 50+ boost", arc_color=C_ACCENT, size=110
+        )
+        self.fan_speed_knob.on_change(self._on_fan_speed_knob)
+        knob_row.pack_start(knob_lbl, False, False, 0)
+        knob_row.pack_start(self.fan_speed_knob, False, False, 0)
+        boost_note = Gtk.Label(
+            label="This driver's fan curve is broken on this hardware — boost is on/off only."
+        )
+        boost_note.get_style_context().add_class("desc-label")
+        boost_note.set_halign(Gtk.Align.CENTER)
+        boost_note.set_line_wrap(True)
+        knob_row.pack_start(boost_note, False, False, 4)
+        card.pack_start(knob_row, False, False, 4)
+
+        return card
+
+    def _start_fan_rpm_polling(self):
+        if self._fan_rpm_timer is not None:
+            return
+        self._refresh_fan_rpm()  # immediate first read
+        self._fan_rpm_timer = GLib.timeout_add(FAN_RPM_POLL_MS, self._refresh_fan_rpm)
+
+    def _stop_fan_rpm_polling(self):
+        if self._fan_rpm_timer is not None:
+            GLib.source_remove(self._fan_rpm_timer)
+            self._fan_rpm_timer = None
+
+    def _refresh_fan_rpm(self):
+        def _do():
+            cpu_rpm, gpu_rpm = self.fan_service.read_rpm()
+            GLib.idle_add(self.cpu_rpm_lbl.set_text, str(cpu_rpm))
+            GLib.idle_add(self.gpu_rpm_lbl.set_text, str(gpu_rpm))
+        self._async(_do)
+        return True  # keep the GLib timer running
+
+    def _on_fan_speed_knob(self, v):
+        boost = int(v) >= 50
+        if boost == self._fan_boost_active:
+            return  # no state change — avoid redundant writes/reloads while dragging
+        self._fan_boost_active = boost
+        if boost:
+            self._status("Fan boost -> ON ...")
+            self._async(self._do_fan_boost_on)
+        else:
+            self._status("Fan boost -> OFF, reloading driver to release...")
+            self._async(self._do_fan_boost_off)
+
+    def _do_fan_boost_on(self):
+        ok, err = self.fan_service.set_max_fan(True)
+        self._status("Fan boost ON" if ok else f"Error: {err}", ok)
+
+    def _do_fan_boost_off(self):
+        # max_fan=0 alone leaves the EC with no active governor (verified — fans
+        # just hold at max). A full module reload is the only proven way to
+        # actually release it, so we pay that cost here rather than lie about
+        # boost being "off" while the fans are still pinned high.
+        ok, err = self.service.reload_module()
+        if not ok:
+            self._status(f"Reload failed: {err}", False)
+            return
+        ok2, err2 = self.service.reapply_last_state()
+        msg = "Fan boost OFF — driver reloaded"
+        if not ok2:
+            msg += f" (RGB restore failed: {err2})"
+        self._status(msg, True)
+
+    # ── Thermal profile ────────────────────────────────────────────────────────
+    def _build_fan_profile_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("card")
+        card.pack_start(self._sec("THERMAL PROFILE"), False, False, 0)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for key, label in THERMAL_PROFILES:
+            btn = Gtk.Button(label=label)
+            btn.set_hexpand(True)
+            ctx = btn.get_style_context()
+            ctx.add_class("mode-btn")
+            if key == self._fan_thermal_profile:
+                ctx.add_class("mode-active"); ctx.remove_class("mode-btn")
+            btn.connect("clicked", self._on_fan_profile_click, key)
+            row.pack_start(btn, True, True, 0)
+            self._fan_profile_buttons[key] = btn
+        card.pack_start(row, False, False, 0)
+
+        return card
+
+    def _highlight_fan_profile(self, key):
+        self._fan_thermal_profile = key
+        for k, btn in self._fan_profile_buttons.items():
+            ctx = btn.get_style_context()
+            if k == key:
+                ctx.add_class("mode-active"); ctx.remove_class("mode-btn")
+            else:
+                ctx.remove_class("mode-active"); ctx.add_class("mode-btn")
+
+    def _on_fan_profile_click(self, btn, key):
+        self._highlight_fan_profile(key)
+        self._status(f"Thermal profile -> {key} ...")
+        self._async(self._do_fan_profile, key)
+
+    def _do_fan_profile(self, key):
+        ok, err = self.fan_service.set_thermal_profile(key)
+        self._status(f"Thermal profile: {key} OK" if ok else f"Error: {err}", ok)
+        if ok:
+            # Driver copies its built-in preset curve into fan_curve on profile change —
+            # refresh our editor rows so they reflect what's now active.
+            state = self.fan_service.read_state()
+            if state["curve"]:
+                GLib.idle_add(self._replace_fan_curve_rows, state["curve"])
+
+    # ── Custom fan curve ───────────────────────────────────────────────────────
+    def _build_fan_curve_card(self):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        card.get_style_context().add_class("card")
+
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hdr.pack_start(self._sec("CUSTOM FAN CURVE"), True, True, 0)
+        fan_state = self.fan_service.read_state()
+        self._fan_curve_enable_switch = Gtk.Switch()
+        self._fan_curve_enable_switch.set_active(fan_state["curve_enable"])
+        self._fan_curve_enable_switch.set_valign(Gtk.Align.CENTER)
+        self._fan_curve_enable_switch.set_tooltip_text(
+            "Disabled: this driver's fan_curve_enable write always fails with "
+            "ENODEV on this hardware/kernel (verified — not curve-content dependent)."
+        )
+        self._fan_curve_enable_switch.set_sensitive(False)
+        hdr.pack_start(self._fan_curve_enable_switch, False, False, 0)
+        card.pack_start(hdr, False, False, 0)
+
+        desc = Gtk.Label(
+            label="Unavailable on this hardware — fan_curve_enable fails with ENODEV "
+                  "regardless of curve content (verified against the driver's own "
+                  "auto-generated curves too). Use the Fan Boost knob above instead."
+        )
+        desc.set_halign(Gtk.Align.START)
+        desc.set_line_wrap(True)
+        desc.get_style_context().add_class("desc-label")
+        card.pack_start(desc, False, False, 0)
+
+        self._fan_points_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        card.pack_start(self._fan_points_box, False, False, 0)
+        self._replace_fan_curve_rows(self._fan_curve_points)
+        self._fan_points_box.set_sensitive(False)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        add_btn = Gtk.Button(label="+ Add Point")
+        add_btn.get_style_context().add_class("fan-add-btn")
+        add_btn.connect("clicked", self._on_fan_point_add)
+        add_btn.set_sensitive(False)
+        btn_row.pack_start(add_btn, False, False, 0)
+
+        apply_btn = Gtk.Button(label="Apply Curve")
+        apply_btn.get_style_context().add_class("fan-apply-btn")
+        apply_btn.connect("clicked", self._on_fan_curve_apply)
+        apply_btn.set_sensitive(False)
+        btn_row.pack_end(apply_btn, False, False, 0)
+        card.pack_start(btn_row, False, False, 4)
+
+        return card
+
+    def _replace_fan_curve_rows(self, points):
+        """Rebuild the point-row list from a fresh [(temp, percent), ...] list."""
+        box = self._fan_points_box
+        for child in box.get_children():
+            box.remove(child)
+        self._fan_curve_rows = []
+        for temp, pct in points:
+            self._add_fan_curve_row(temp, pct)
+        box.show_all()
+
+    def _add_fan_curve_row(self, temp=50, pct=50):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row.get_style_context().add_class("fan-curve-row")
+
+        temp_lbl = Gtk.Label(label="°C")
+        temp_lbl.get_style_context().add_class("desc-label")
+        temp_spin = Gtk.SpinButton.new_with_range(-20, 110, 1)
+        temp_spin.set_value(temp)
+
+        pct_lbl = Gtk.Label(label="%")
+        pct_lbl.get_style_context().add_class("desc-label")
+        pct_spin = Gtk.SpinButton.new_with_range(0, 100, 1)
+        pct_spin.set_value(pct)
+
+        del_btn = Gtk.Button(label="✕")
+        del_btn.get_style_context().add_class("fan-point-del-btn")
+        del_btn.set_tooltip_text("Remove this point")
+
+        row.pack_start(temp_spin, False, False, 0)
+        row.pack_start(temp_lbl,  False, False, 0)
+        row.pack_start(pct_spin,  False, False, 0)
+        row.pack_start(pct_lbl,   False, False, 0)
+        row.pack_end(del_btn,     False, False, 0)
+
+        entry = (temp_spin, pct_spin, row)
+        del_btn.connect("clicked", self._on_fan_point_delete, entry)
+
+        self._fan_curve_rows.append(entry)
+        self._fan_points_box.pack_start(row, False, False, 0)
+        self._fan_points_box.show_all()
+
+    def _on_fan_point_add(self, btn):
+        if len(self._fan_curve_rows) >= FAN_CURVE_MAX_POINTS:
+            self._status(f"Maximum {FAN_CURVE_MAX_POINTS} points reached.", False)
+            return
+        self._add_fan_curve_row()
+
+    def _on_fan_point_delete(self, btn, entry):
+        if len(self._fan_curve_rows) <= 2:
+            self._status("At least 2 points are required.", False)
+            return
+        _, _, row = entry
+        self._fan_curve_rows.remove(entry)
+        self._fan_points_box.remove(row)
+
+    def _on_fan_curve_apply(self, btn):
+        points = [(int(t.get_value()), int(p.get_value())) for t, p, _ in self._fan_curve_rows]
+        self._fan_curve_points = points
+        btn.set_sensitive(False)
+        self._status("Applying fan curve...")
+
+        def _do():
+            ok, err = self.fan_service.set_curve(points)
+            GLib.idle_add(btn.set_sensitive, True)
+            GLib.idle_add(self._status, "Fan curve applied!" if ok else f"Error: {err}", ok)
+
         self._async(_do)

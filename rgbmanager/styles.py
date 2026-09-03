@@ -228,6 +228,70 @@ window { background-color: #0F0F23; }
     color: #A78BFA;
 }
 .layer-save-btn:hover { background-color: #7C3AED; color: #fff; }
+
+/* ============ Notebook tabs ============ */
+notebook tab {
+    padding: 8px 18px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #64748B;
+}
+notebook tab:checked {
+    color: #A78BFA;
+}
+notebook header {
+    background-color: #0F0F23;
+    border-bottom: 1px solid #2A2545;
+}
+
+/* ============ Fan panel ============ */
+.rpm-value {
+    font-size: 28px;
+    font-weight: bold;
+    color: #E2E8F0;
+}
+.rpm-unit {
+    font-size: 11px;
+    color: #64748B;
+    letter-spacing: 1px;
+}
+.fan-curve-row {
+    background-color: #1A1338;
+    border-radius: 10px;
+    padding: 8px 12px;
+    border: 1px solid #2A2545;
+    margin-bottom: 4px;
+}
+.fan-add-btn {
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 7px 14px;
+    background-color: #1E1840;
+    border: 1px solid #2A2545;
+    color: #A78BFA;
+}
+.fan-add-btn:hover { background-color: #2A2545; border-color: #7C3AED; }
+.fan-apply-btn {
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 7px 16px;
+    background-color: #1B4D35;
+    border: 1px solid #22C55E;
+    color: #22C55E;
+}
+.fan-apply-btn:hover { background-color: #22C55E; color: #0F0F23; }
+.fan-point-del-btn {
+    border-radius: 6px;
+    font-size: 13px;
+    padding: 4px 10px;
+    min-height: 26px;
+    background-color: transparent;
+    border: 1px solid #3A2030;
+    color: #64748B;
+}
+.fan-point-del-btn:hover { border-color: #F85149; color: #F85149; }
 """
 
 
